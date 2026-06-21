@@ -175,3 +175,32 @@ Read these docs whenever relevant:
 - `pixi`:
   - <https://pixi.prefix.dev/latest/reference/pixi_manifest/>
   - <https://pixi.prefix.dev/latest/reference/pixi_configuration/>
+
+## Cursor Cloud specific instructions
+
+The cloud VM is bootstrapped before each session: system packages and the `mise`
+binary are baked into the snapshot, and the startup update script runs
+`mise install` (the same chain as the devcontainer `postCreateCommand`). `mise`
+is on the default `PATH` via `/usr/local/bin/mise`. Use the standard tasks in
+the Workflow section above; the notes below cover only non-obvious caveats.
+
+- The host variant auto-selects to `linux-x64-vulkan`. Rendering runs on
+  software Vulkan (lavapipe, from the `mesa-vulkan-drivers` apt package), so
+  `mise run //examples/zig-readback:run` works headlessly without a display.
+- The default system compiler is set to gcc/g++ (`update-alternatives` for `cc`
+  and `c++`), matching CI and the devcontainer. Keep it that way: when `c++`
+  points at clang, the build auto-enables `clang-tidy`, and the bundled conda
+  `clang-tools` package ships no builtin headers, so the C API target fails with
+  `'stddef.h' file not found`. If a build hits missing
+  `stddef.h`/`cstdio`/`algorithm` headers, confirm `cc`/`c++` resolve to
+  gcc/g++.
+- Headless rendering on the Vulkan variant needs no extra env. The EGL/OpenGL
+  variant (`mise -E linux-x64-egl run ...`) needs `EGL_PLATFORM=surfaceless` and
+  `LIBGL_ALWAYS_SOFTWARE=true`, as set in `.devcontainer/devcontainer.json`.
+- GUI examples (`zig-map`, `rust-map`, `lwjgl-map`, `dotnet-map`) need a display
+  and are build-only in CI; `zig-readback` is the headless render smoke test.
+- Swift bindings/examples and Android/iOS targets require Apple or Android hosts
+  and do not run on this Linux VM.
+- `mise install` rewrites `mise.lock` on different machines; this drift is
+  expected (CI excludes `mise.lock` from its clean-tree check) and should not be
+  committed.
