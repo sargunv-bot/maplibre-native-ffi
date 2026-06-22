@@ -7,7 +7,6 @@ import java.lang.ref.Cleaner;
 import java.util.Objects;
 import java.util.function.Consumer;
 import org.maplibre.nativeffi.error.InvalidStateException;
-import org.maplibre.nativeffi.error.MaplibreException;
 import org.maplibre.nativeffi.error.MaplibreStatus;
 import org.maplibre.nativeffi.internal.access.InternalAccess;
 import org.maplibre.nativeffi.internal.c.MapLibreNativeC;
@@ -76,7 +75,7 @@ public final class ResourceRequestHandle implements AutoCloseable {
           "ResourceRequestHandle is already completed");
     }
     requireLive();
-    MaplibreException completionFailure = null;
+    Throwable completionFailure = null;
     try {
       try (var arena = Arena.ofConfined()) {
         var nativeStatus =
@@ -84,7 +83,7 @@ public final class ResourceRequestHandle implements AutoCloseable {
                 handle, ResourceStructs.resourceResponse(Objects.requireNonNull(response), arena));
         Status.check(nativeStatus);
       }
-    } catch (MaplibreException error) {
+    } catch (Throwable error) {
       completionFailure = error;
     }
     completed = true;
@@ -93,7 +92,13 @@ public final class ResourceRequestHandle implements AutoCloseable {
       releaseNative();
     }
     if (completionFailure != null) {
-      throw completionFailure;
+      if (completionFailure instanceof RuntimeException runtimeException) {
+        throw runtimeException;
+      }
+      if (completionFailure instanceof Error error) {
+        throw error;
+      }
+      throw new AssertionError(completionFailure);
     }
   }
 
