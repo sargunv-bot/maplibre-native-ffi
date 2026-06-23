@@ -3,6 +3,7 @@
 
 #include <emscripten.h>
 #include <emscripten/eventloop.h>
+#include <emscripten/threading.h>
 
 #include <atomic>
 #include <chrono>

@@ -1,6 +1,7 @@
 #include <mbgl/util/async_task.hpp>
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 
 #include <atomic>
 #include <functional>
