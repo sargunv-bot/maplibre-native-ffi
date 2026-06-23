@@ -7,9 +7,12 @@ function(mln_configure_options)
 
   set(MLN_FFI_RENDER_BACKEND ""
       CACHE STRING "Render backend for this wrapper build")
+  set(MLN_FFI_WEBGPU_IMPL ""
+      CACHE STRING "WebGPU implementation for this wrapper build")
+  set_property(CACHE MLN_FFI_WEBGPU_IMPL PROPERTY STRINGS dawn wgpu emdawn)
   set_property(
     CACHE MLN_FFI_RENDER_BACKEND
-    PROPERTY STRINGS metal opengl vulkan)
+    PROPERTY STRINGS metal opengl vulkan webgpu)
   set(MLN_FFI_OPENGL_CONTEXT_PROVIDER ""
       CACHE STRING "OpenGL context provider for this wrapper build")
   set_property(CACHE MLN_FFI_OPENGL_CONTEXT_PROVIDER PROPERTY STRINGS egl wgl)
@@ -18,8 +21,34 @@ function(mln_configure_options)
   string(TOLOWER "${MLN_FFI_RENDER_BACKEND}" MLN_FFI_RENDER_BACKEND)
   string(TOLOWER "${MLN_FFI_OPENGL_CONTEXT_PROVIDER}"
          MLN_FFI_OPENGL_CONTEXT_PROVIDER)
-  if(NOT MLN_FFI_RENDER_BACKEND MATCHES "^(metal|opengl|vulkan)$")
+  string(TOLOWER "${MLN_FFI_WEBGPU_IMPL}" MLN_FFI_WEBGPU_IMPL)
+  if(NOT MLN_FFI_RENDER_BACKEND MATCHES "^(metal|opengl|vulkan|webgpu)$")
     message(FATAL_ERROR "Unsupported render backend: ${MLN_FFI_RENDER_BACKEND}")
+  endif()
+  if(MLN_FFI_RENDER_BACKEND STREQUAL "webgpu")
+    if(EMSCRIPTEN)
+      if(NOT MLN_FFI_WEBGPU_IMPL)
+        set(MLN_FFI_WEBGPU_IMPL "emdawn")
+      endif()
+      if(NOT MLN_FFI_WEBGPU_IMPL STREQUAL "emdawn")
+        message(
+          FATAL_ERROR
+            "Emscripten WebGPU builds require MLN_FFI_WEBGPU_IMPL=emdawn")
+      endif()
+    else()
+      if(NOT MLN_FFI_WEBGPU_IMPL)
+        set(MLN_FFI_WEBGPU_IMPL "dawn")
+      endif()
+      if(NOT MLN_FFI_WEBGPU_IMPL MATCHES "^(dawn|wgpu)$")
+        message(
+          FATAL_ERROR
+            "Native WebGPU builds require MLN_FFI_WEBGPU_IMPL=dawn or wgpu")
+      endif()
+    endif()
+  elseif(MLN_FFI_WEBGPU_IMPL)
+    message(
+      FATAL_ERROR
+        "MLN_FFI_WEBGPU_IMPL is only valid for WebGPU builds")
   endif()
 
   set(MLN_FFI_IS_IOS_SIMULATOR FALSE)
@@ -67,6 +96,12 @@ function(mln_configure_options)
       CACHE BOOL "Build MapLibre Native OpenGL backend" FORCE)
   set(MLN_WITH_VULKAN OFF
       CACHE BOOL "Build MapLibre Native Vulkan backend" FORCE)
+  set(MLN_WITH_WEBGPU OFF
+      CACHE BOOL "Build MapLibre Native WebGPU backend" FORCE)
+  set(MLN_WEBGPU_IMPL_DAWN OFF
+      CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
+  set(MLN_WEBGPU_IMPL_WGPU OFF
+      CACHE BOOL "Build MapLibre Native WebGPU with wgpu-native" FORCE)
   set(MLN_WITH_EGL OFF CACHE BOOL "Build MapLibre Native EGL support" FORCE)
   if(MLN_FFI_RENDER_BACKEND STREQUAL "metal")
     set(MLN_WITH_METAL ON
@@ -80,6 +115,19 @@ function(mln_configure_options)
   elseif(MLN_FFI_RENDER_BACKEND STREQUAL "vulkan")
     set(MLN_WITH_VULKAN ON
         CACHE BOOL "Build MapLibre Native Vulkan backend" FORCE)
+  elseif(MLN_FFI_RENDER_BACKEND STREQUAL "webgpu")
+    set(MLN_WITH_WEBGPU ON
+        CACHE BOOL "Build MapLibre Native WebGPU backend" FORCE)
+    if(MLN_FFI_WEBGPU_IMPL STREQUAL "emdawn")
+      set(MLN_WEBGPU_IMPL_DAWN ON
+          CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
+    elseif(MLN_FFI_WEBGPU_IMPL STREQUAL "dawn")
+      set(MLN_WEBGPU_IMPL_DAWN ON
+          CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
+    elseif(MLN_FFI_WEBGPU_IMPL STREQUAL "wgpu")
+      set(MLN_WEBGPU_IMPL_WGPU ON
+          CACHE BOOL "Build MapLibre Native WebGPU with wgpu-native" FORCE)
+    endif()
   endif()
 
   set(MLN_WITH_WERROR OFF
@@ -87,11 +135,16 @@ function(mln_configure_options)
 
   set(MLN_FFI_ENABLE_CLANG_TIDY_DEFAULT OFF)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang"
-     AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+     AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android"
+     AND NOT EMSCRIPTEN)
     set(MLN_FFI_ENABLE_CLANG_TIDY_DEFAULT ON)
   endif()
   option(MLN_FFI_ENABLE_CLANG_TIDY "Run clang-tidy for wrapper sources"
          ${MLN_FFI_ENABLE_CLANG_TIDY_DEFAULT})
+  if(EMSCRIPTEN)
+    set(MLN_FFI_ENABLE_CLANG_TIDY OFF CACHE BOOL
+        "Run clang-tidy for wrapper sources" FORCE)
+  endif()
 
   if(MLN_FFI_RENDER_BACKEND STREQUAL "opengl")
     message(
@@ -103,6 +156,7 @@ function(mln_configure_options)
   endif()
 
   set(MLN_FFI_RENDER_BACKEND "${MLN_FFI_RENDER_BACKEND}" PARENT_SCOPE)
+  set(MLN_FFI_WEBGPU_IMPL "${MLN_FFI_WEBGPU_IMPL}" PARENT_SCOPE)
   set(MLN_FFI_OPENGL_CONTEXT_PROVIDER "${MLN_FFI_OPENGL_CONTEXT_PROVIDER}"
       PARENT_SCOPE)
   set(MLN_FFI_EGL_ROOT "${MLN_FFI_EGL_ROOT}" PARENT_SCOPE)
