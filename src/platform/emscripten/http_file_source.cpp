@@ -1,13 +1,7 @@
-#include <mbgl/storage/http_file_source.hpp>
-#include <mbgl/util/async_request.hpp>
-#include <mbgl/storage/resource.hpp>
-#include <mbgl/storage/resource_options.hpp>
-#include <mbgl/storage/response.hpp>
-#include <mbgl/util/async_task.hpp>
-#include <mbgl/util/client_options.hpp>
-#include <mbgl/util/string.hpp>
-
-#include <emscripten/fetch.h>
+// Browser HTTP via emscripten_fetch. We keep this in C++ rather than the Rust
+// ureq stack used on desktop: fetch respects CORS, cookies, and the page cache;
+// ureq opens raw sockets that WASM cannot use. A future Rust wrapper around
+// fetch would not shrink the binary compared to this direct binding.
 
 #include <cstring>
 #include <memory>
@@ -15,6 +9,17 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <mbgl/storage/http_file_source.hpp>
+#include <mbgl/storage/resource.hpp>
+#include <mbgl/storage/resource_options.hpp>
+#include <mbgl/storage/response.hpp>
+#include <mbgl/util/async_request.hpp>
+#include <mbgl/util/async_task.hpp>
+#include <mbgl/util/client_options.hpp>
+#include <mbgl/util/string.hpp>
+
+#include <emscripten/fetch.h>
 
 namespace mbgl {
 
@@ -61,7 +66,8 @@ auto makeResponse(const Resource& resource, emscripten_fetch_t* fetch)
   return result;
 }
 
-class FetchRequestState : public std::enable_shared_from_this<FetchRequestState> {
+class FetchRequestState
+    : public std::enable_shared_from_this<FetchRequestState> {
  public:
   FetchRequestState(Resource resource_, FileSource::Callback callback_)
       : resource(std::move(resource_)), callback(std::move(callback_)) {}
@@ -77,11 +83,14 @@ class FetchRequestState : public std::enable_shared_from_this<FetchRequestState>
     emscripten_fetch_attr_init(&attributes);
     std::strcpy(attributes.requestMethod, "GET");
     attributes.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
-    attributes.onsuccess =
-      [](emscripten_fetch_t* fetch) { onFetchComplete(fetch); };
-    attributes.onerror =
-      [](emscripten_fetch_t* fetch) { onFetchComplete(fetch); };
-    attributes.userData = new std::shared_ptr<FetchRequestState>(shared_from_this());
+    attributes.onsuccess = [](emscripten_fetch_t* fetch) {
+      onFetchComplete(fetch);
+    };
+    attributes.onerror = [](emscripten_fetch_t* fetch) {
+      onFetchComplete(fetch);
+    };
+    attributes.userData =
+      new std::shared_ptr<FetchRequestState>(shared_from_this());
 
     const auto url = resource.url;
     fetch = emscripten_fetch(&attributes, url.c_str());
@@ -148,9 +157,11 @@ class FetchRequestState : public std::enable_shared_from_this<FetchRequestState>
 class FetchRequest : public AsyncRequest {
  public:
   FetchRequest(Resource resource, FileSource::Callback callback)
-      : state(std::make_shared<FetchRequestState>(
-          std::move(resource), std::move(callback)
-        )) {
+      : state(
+          std::make_shared<FetchRequestState>(
+            std::move(resource), std::move(callback)
+          )
+        ) {
     state->start();
   }
 
@@ -164,7 +175,9 @@ class FetchRequest : public AsyncRequest {
 
 class HTTPFileSource::Impl {
  public:
-  Impl(const ResourceOptions& resource_options, const ClientOptions& client_options)
+  Impl(
+    const ResourceOptions& resource_options, const ClientOptions& client_options
+  )
       : resource_options_(resource_options.clone()),
         client_options_(client_options.clone()) {}
 
@@ -222,6 +235,8 @@ void HTTPFileSource::setClientOptions(ClientOptions options) {
   impl->setClientOptions(std::move(options));
 }
 
-ClientOptions HTTPFileSource::getClientOptions() { return impl->getClientOptions(); }
+ClientOptions HTTPFileSource::getClientOptions() {
+  return impl->getClientOptions();
+}
 
 }  // namespace mbgl

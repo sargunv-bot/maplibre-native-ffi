@@ -3,6 +3,8 @@ MLN_FFI_RENDER_BACKEND = "webgpu"
 MLN_FFI_WEBGPU_IMPL = "emdawn"
 MLN_FFI_BUILD_DIR = "{{config_root}}/build/browser-wasm64-webgpu-dawn"
 MLN_FFI_ZIG_BUILD_ARGS = "-Dtarget=wasm32-emscripten"
+CARGO_BUILD_TARGET = "wasm32-unknown-emscripten"
+RUSTFLAGS = "-C target-feature=+atomics,+bulk-memory -C panic=abort"
 
 [tools]
 "github:emscripten-core/emsdk" = "4.0.10"

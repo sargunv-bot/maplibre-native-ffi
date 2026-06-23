@@ -1,10 +1,15 @@
-#include <mbgl/actor/scheduler.hpp>
-#include <mbgl/util/async_task.hpp>
-#include <mbgl/util/run_loop.hpp>
+// Emscripten run loop without libuv. Default platform uses libuv for async wake
+// and FD watches; libuv's Emscripten port is not wired in this build. Worker
+// pthreads block on a condition variable; the main thread is driven by
+// mln_runtime_run_once() from requestAnimationFrame.
 
 #include <cassert>
 #include <functional>
 #include <stdexcept>
+
+#include <mbgl/actor/scheduler.hpp>
+#include <mbgl/util/async_task.hpp>
+#include <mbgl/util/run_loop.hpp>
 
 #include "run_loop_wake.hpp"
 
@@ -77,7 +82,9 @@ void RunLoop::stop() {
 
 void RunLoop::updateTime() {}
 
-void RunLoop::waitForEmpty([[maybe_unused]] const mbgl::util::SimpleIdentity tag) {
+void RunLoop::waitForEmpty(
+  [[maybe_unused]] const mbgl::util::SimpleIdentity tag
+) {
   while (true) {
     std::size_t remaining;
     {
