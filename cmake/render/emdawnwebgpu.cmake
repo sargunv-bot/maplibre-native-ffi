@@ -14,7 +14,6 @@ function(mln_configure_emdawnwebgpu target)
     PRIVATE
       "${_emdawn_flags}"
       "-sASYNCIFY"
-      "-sALLOW_MEMORY_GROWTH=1"
       "-sNO_DISABLE_EXCEPTION_CATCHING"
       "-sUSE_ZLIB=1"
       "-sUSE_LIBPNG=1"
@@ -36,7 +35,6 @@ function(mln_prepare_emdawnwebgpu_vendor)
       INTERFACE
         "--use-port=emdawnwebgpu"
         "-sASYNCIFY"
-        "-sALLOW_MEMORY_GROWTH=1"
         "-sNO_DISABLE_EXCEPTION_CATCHING"
         "-sUSE_ZLIB=1"
         "-sUSE_LIBPNG=1"

@@ -45,6 +45,7 @@ include(mln_target)
 
 mln_configure_options()
 if(EMSCRIPTEN)
+  include(emscripten)
   include(render/emdawnwebgpu)
   add_compile_options("--use-port=emdawnwebgpu" "-sUSE_ZLIB=1")
 endif()

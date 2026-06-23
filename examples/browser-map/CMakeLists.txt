@@ -17,9 +17,8 @@ target_link_options(
   PRIVATE
     "--use-port=emdawnwebgpu"
     "-sASYNCIFY"
-    "-sALLOW_MEMORY_GROWTH=1"
     "-sFETCH=1"
-    "-sENVIRONMENT=web"
+    "-sENVIRONMENT=web,worker"
     "-sEXPORTED_FUNCTIONS=['_mln_browser_map_init','_main','_malloc','_free']"
     "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap']"
     "-sMODULARIZE=1"
