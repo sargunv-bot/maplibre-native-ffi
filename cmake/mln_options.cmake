@@ -98,10 +98,12 @@ function(mln_configure_options)
       CACHE BOOL "Build MapLibre Native Vulkan backend" FORCE)
   set(MLN_WITH_WEBGPU OFF
       CACHE BOOL "Build MapLibre Native WebGPU backend" FORCE)
+  set(MLN_WEBGPU_VENDOR ""
+      CACHE STRING "WebGPU vendor for MapLibre Native core" FORCE)
   set(MLN_WEBGPU_IMPL_DAWN OFF
-      CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
+      CACHE BOOL "Deprecated: use MLN_WEBGPU_VENDOR=dawn" FORCE)
   set(MLN_WEBGPU_IMPL_WGPU OFF
-      CACHE BOOL "Build MapLibre Native WebGPU with wgpu-native" FORCE)
+      CACHE BOOL "Deprecated: use MLN_WEBGPU_VENDOR=wgpu" FORCE)
   set(MLN_WITH_EGL OFF CACHE BOOL "Build MapLibre Native EGL support" FORCE)
   if(MLN_FFI_RENDER_BACKEND STREQUAL "metal")
     set(MLN_WITH_METAL ON
@@ -118,16 +120,15 @@ function(mln_configure_options)
   elseif(MLN_FFI_RENDER_BACKEND STREQUAL "webgpu")
     set(MLN_WITH_WEBGPU ON
         CACHE BOOL "Build MapLibre Native WebGPU backend" FORCE)
-    if(MLN_FFI_WEBGPU_IMPL STREQUAL "emdawn")
-      set(MLN_WEBGPU_IMPL_DAWN ON
-          CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
-    elseif(MLN_FFI_WEBGPU_IMPL STREQUAL "dawn")
-      set(MLN_WEBGPU_IMPL_DAWN ON
-          CACHE BOOL "Build MapLibre Native WebGPU with Dawn" FORCE)
-    elseif(MLN_FFI_WEBGPU_IMPL STREQUAL "wgpu")
-      set(MLN_WEBGPU_IMPL_WGPU ON
-          CACHE BOOL "Build MapLibre Native WebGPU with wgpu-native" FORCE)
+    if(NOT MLN_FFI_WEBGPU_IMPL)
+      if(EMSCRIPTEN)
+        set(MLN_FFI_WEBGPU_IMPL "emdawn")
+      else()
+        set(MLN_FFI_WEBGPU_IMPL "dawn")
+      endif()
     endif()
+    set(MLN_WEBGPU_VENDOR "${MLN_FFI_WEBGPU_IMPL}"
+        CACHE STRING "WebGPU vendor for MapLibre Native core" FORCE)
   endif()
 
   set(MLN_WITH_WERROR OFF

@@ -1,11 +1,6 @@
 function(mln_add_maplibre_native)
   set(MLN_SOURCE_DIR "${PROJECT_SOURCE_DIR}/third_party/maplibre-native")
 
-  if(EMSCRIPTEN)
-    include(render/emdawnwebgpu)
-    mln_prepare_emdawnwebgpu_vendor()
-  endif()
-
   if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
     # OHOS SDK 6.x exposes some libc++ C++20 facilities behind this clang flag.
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
@@ -21,6 +16,9 @@ function(mln_add_maplibre_native)
   if(EMSCRIPTEN)
     include(render/emdawnwebgpu)
     mln_configure_emdawnwebgpu(mbgl-core)
+    if(TARGET mbgl-vendor-webgpu-emdawn)
+      mln_configure_emdawnwebgpu(mbgl-vendor-webgpu-emdawn)
+    endif()
   endif()
 
   if(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
