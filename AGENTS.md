@@ -176,3 +176,20 @@ Read these docs whenever relevant:
 - `pixi`:
   - <https://pixi.prefix.dev/latest/reference/pixi_manifest/>
   - <https://pixi.prefix.dev/latest/reference/pixi_configuration/>
+
+## Cursor Cloud specific instructions
+
+The startup update script runs `mise trust .` then `mise install`, which pulls
+all tools, submodules, and managed dependencies (see the Workflow section for
+the standard build/test/run tasks). Notes specific to this headless Linux VM:
+
+- The host-matching env auto-selects to `linux-x64-vulkan`. Rendering runs
+  headlessly through lavapipe (the `lvp_icd.json` software Vulkan ICD), so no
+  display or GPU is needed. `mise run //examples/zig-readback:run` writes a
+  rendered map to `examples/zig-readback/zig-out/zig-readback.ppm`; convert it
+  with `ffmpeg` if you need a PNG.
+- The mise-managed Swift toolchain needs the system library `libncurses.so.6` at
+  install time; it is provided by the `libncurses6` apt package, which is baked
+  into the VM image (not the update script). If `mise install` fails with
+  `libncurses.so.6: cannot open shared object file`, run
+  `sudo apt-get install -y libncurses6` and re-run `mise install`.
