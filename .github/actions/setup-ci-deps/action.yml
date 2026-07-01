@@ -164,4 +164,4 @@ runs:
     # from mise config instead of redeclaring components/targets here.
     - name: Ensure Rust toolchain
       shell: bash
-      run: MISE_NO_HOOKS=1 mise install --force rust
+      run: MISE_NO_HOOKS=1 mise install rust || MISE_NO_HOOKS=1 mise install --force rust
