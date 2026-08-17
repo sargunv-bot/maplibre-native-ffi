@@ -1,6 +1,6 @@
 // Raw C ABI coverage for the batch event drain and the two subscription masks:
-// batch layout and lifetime, bounded drains, mask validation, and the
-// suppression a cleared mask bit causes at push time.
+// batch layout and lifetime, bounded drains, source teardown, mask validation,
+// and the suppression a cleared mask bit causes at push time.
 
 #include <assert.h>
 #include <stdatomic.h>
@@ -508,6 +508,59 @@ static void a_bounded_drain_reports_what_stayed_queued(void) {
   mln_test_destroy_runtime(runtime);
 }
 
+// Destroying a map drops that map's still-queued events and leaves the other
+// map's messages packed in the arena the next drain transfers.
+static void destroying_a_map_discards_its_queued_events(void) {
+  mln_runtime runtime = mln_test_create_runtime();
+  mln_map first = mln_test_create_map(runtime);
+  mln_map second = mln_test_create_map(runtime);
+  mln_test_drain_all(runtime);
+
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_NATIVE_ERROR,
+    mln_map_set_style_json(first, MLN_BUFFER_LITERAL("{\"version\":"))
+  );
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_NATIVE_ERROR,
+    mln_map_set_style_json(second, MLN_BUFFER_LITERAL("not json at all"))
+  );
+
+  mln_test_destroy_map(first);
+
+  mln_runtime_event_batch batch = mln_runtime_event_batch_default();
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_drain_events(runtime, 0, &batch)
+  );
+
+  size_t first_sourced = 0;
+  size_t second_failures = 0;
+  for (size_t index = 0; index < batch.event_count; index += 1) {
+    const mln_runtime_event* event = batch_event(&batch, index);
+    if (event->source == first) {
+      first_sourced += 1;
+    }
+    if (
+      event->type != MLN_RUNTIME_EVENT_MAP_LOADING_FAILED ||
+      event->source != second
+    ) {
+      continue;
+    }
+    second_failures += 1;
+    TEST_ASSERT_GREATER_THAN_UINT32(0, event->message_size);
+    TEST_ASSERT_TRUE(
+      (size_t)event->message_offset + event->message_size <= batch.messages_size
+    );
+    TEST_ASSERT_EQUAL_CHAR(
+      '\0', batch.messages[event->message_offset + event->message_size]
+    );
+  }
+  TEST_ASSERT_EQUAL_size_t(0, first_sourced);
+  TEST_ASSERT_GREATER_THAN_size_t(0, second_failures);
+
+  mln_test_destroy_map(second);
+  mln_test_destroy_runtime(runtime);
+}
+
 // A batch holds copies on the runtime, so destroying the map whose events it
 // carries leaves it readable.
 static void a_batch_outlives_the_map_that_produced_it(void) {
@@ -538,6 +591,72 @@ static void a_batch_outlives_the_map_that_produced_it(void) {
   }
   TEST_ASSERT_GREATER_THAN_size_t(0, map_sourced);
 
+  mln_test_destroy_runtime(runtime);
+}
+
+// A bounded drain copies a prefix of the packed arena, so the events that
+// stayed queued keep valid offsets into the remainder.
+static void a_bounded_drain_keeps_remaining_message_offsets(void) {
+  mln_runtime runtime = mln_test_create_runtime();
+  mln_map first = mln_test_create_map(runtime);
+  mln_map second = mln_test_create_map(runtime);
+  mln_test_drain_all(runtime);
+
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_NATIVE_ERROR,
+    mln_map_set_style_json(first, MLN_BUFFER_LITERAL("{\"version\":"))
+  );
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_NATIVE_ERROR,
+    mln_map_set_style_json(second, MLN_BUFFER_LITERAL("not json at all"))
+  );
+
+  mln_runtime_event_batch first_batch = mln_runtime_event_batch_default();
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_drain_events(runtime, 1, &first_batch)
+  );
+  TEST_ASSERT_EQUAL_size_t(1, first_batch.event_count);
+  TEST_ASSERT_GREATER_THAN_size_t(0, first_batch.remaining_count);
+  const mln_runtime_event* first_event = batch_event(&first_batch, 0);
+  if (first_event->message_size == 0) {
+    TEST_ASSERT_EQUAL_UINT32(0, first_event->message_offset);
+  } else {
+    TEST_ASSERT_EQUAL_CHAR(
+      '\0', first_batch
+              .messages[first_event->message_offset + first_event->message_size]
+    );
+  }
+
+  mln_runtime_event_batch second_batch = mln_runtime_event_batch_default();
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_drain_events(runtime, 0, &second_batch)
+  );
+  TEST_ASSERT_GREATER_THAN_size_t(0, second_batch.event_count);
+  TEST_ASSERT_EQUAL_size_t(0, second_batch.remaining_count);
+
+  size_t message_events = first_event->message_size == 0 ? 0 : 1;
+  for (size_t index = 0; index < second_batch.event_count; index += 1) {
+    const mln_runtime_event* event = batch_event(&second_batch, index);
+    if (event->message_size == 0) {
+      TEST_ASSERT_EQUAL_UINT32(0, event->message_offset);
+      continue;
+    }
+    TEST_ASSERT_TRUE(
+      (size_t)event->message_offset + event->message_size <=
+      second_batch.messages_size
+    );
+    TEST_ASSERT_EQUAL_CHAR(
+      '\0', second_batch.messages[event->message_offset + event->message_size]
+    );
+    TEST_ASSERT_EQUAL_size_t(
+      event->message_size, strlen(second_batch.messages + event->message_offset)
+    );
+    message_events += 1;
+  }
+  TEST_ASSERT_GREATER_THAN_size_t(0, message_events);
+
+  mln_test_destroy_map(second);
+  mln_test_destroy_map(first);
   mln_test_destroy_runtime(runtime);
 }
 
@@ -727,6 +846,50 @@ static void a_take_result_reports_the_operations_failure_text(void) {
   mln_test_destroy_runtime(runtime);
 }
 
+// Discarding an operation drops its still-queued completion, so a later drain
+// does not report an event for a retired id.
+static void discarding_an_operation_drops_its_queued_completion(void) {
+  mln_runtime runtime = mln_test_create_runtime();
+  mln_offline_operation_id operation_id = 0;
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_offline_regions_merge_database_start(
+                     runtime, missing_database_path, &operation_id
+                   )
+  );
+  TEST_ASSERT_NOT_EQUAL(0, operation_id);
+
+  mln_offline_region_list regions = MLN_HANDLE_NULL;
+  bool completed = false;
+  for (size_t attempt = 0; attempt < take_result_attempts && !completed;
+       attempt += 1) {
+    TEST_ASSERT_EQUAL_INT(MLN_STATUS_OK, mln_runtime_pump(runtime, 2));
+    completed = mln_runtime_offline_regions_merge_database_take_result(
+                  runtime, operation_id, &regions
+                ) == MLN_STATUS_INVALID_STATE;
+  }
+  TEST_ASSERT_TRUE_MESSAGE(
+    completed, "Merging a missing database should finish before discard."
+  );
+
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_offline_operation_discard(runtime, operation_id)
+  );
+
+  mln_runtime_event_batch batch = mln_runtime_event_batch_default();
+  TEST_ASSERT_EQUAL_INT(
+    MLN_STATUS_OK, mln_runtime_drain_events(runtime, 0, &batch)
+  );
+  for (size_t index = 0; index < batch.event_count; index += 1) {
+    const mln_runtime_event* event = batch_event(&batch, index);
+    TEST_ASSERT_FALSE(
+      event->type == MLN_RUNTIME_EVENT_OFFLINE_OPERATION_COMPLETED &&
+      event->payload.offline_operation_completed.operation_id == operation_id
+    );
+  }
+
+  mln_test_destroy_runtime(runtime);
+}
+
 void run_runtime_events_abi_tests(void) {
   UnitySetTestFile(__FILE__);
   RUN_TEST(a_drain_rejects_an_undersized_batch_or_a_stale_runtime);
@@ -740,8 +903,11 @@ void run_runtime_events_abi_tests(void) {
   RUN_TEST(a_suppressed_producer_leaves_a_pump_parked);
   RUN_TEST(a_batch_reports_this_headers_stride_and_ends_the_previous);
   RUN_TEST(a_bounded_drain_reports_what_stayed_queued);
+  RUN_TEST(destroying_a_map_discards_its_queued_events);
   RUN_TEST(a_batch_outlives_the_map_that_produced_it);
+  RUN_TEST(a_bounded_drain_keeps_remaining_message_offsets);
   RUN_TEST(one_batch_reports_events_in_queue_order);
   RUN_TEST(the_message_arena_carries_one_range_per_event);
   RUN_TEST(a_take_result_reports_the_operations_failure_text);
+  RUN_TEST(discarding_an_operation_drops_its_queued_completion);
 }

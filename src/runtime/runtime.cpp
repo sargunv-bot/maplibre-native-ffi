@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -301,14 +302,368 @@ auto set_offline_result_unavailable_error(
 }
 
 // A batch locates a message by a uint32_t offset and size, so a message is
-// clamped at push rather than at drain time. The arena starts each drain empty,
-// so the first event always fits and a bounded drain always makes progress.
+// clamped at push. The first event of a new segment always fits, and a bounded
+// drain always makes progress.
 auto truncated_event_message(std::string message) -> std::string {
   constexpr auto max_size = static_cast<size_t>(UINT32_MAX) - 1;
   if (message.size() > max_size) {
     message.resize(max_size);
   }
   return message;
+}
+
+constexpr auto event_arena_max = static_cast<size_t>(UINT32_MAX);
+
+[[nodiscard]] auto message_arena_bytes(std::string_view message) -> size_t {
+  return message.empty() ? size_t{0} : message.size() + 1;
+}
+
+[[nodiscard]] auto store_can_fit(
+  const mln::core::RuntimeEventStore& store, size_t message_bytes
+) -> bool {
+  return message_bytes <= event_arena_max - store.messages.size();
+}
+
+[[nodiscard]] auto event_message_end(const mln_runtime_event& event) -> size_t {
+  return event.message_size == 0
+           ? size_t{0}
+           : static_cast<size_t>(event.message_offset) + event.message_size + 1;
+}
+
+[[nodiscard]] auto store_live_count(const mln::core::RuntimeEventStore& store)
+  -> size_t {
+  return store.events.size() - store.event_head;
+}
+
+[[nodiscard]] auto queued_event_count(const mln::core::RuntimeObject& runtime)
+  -> size_t {
+  auto count = size_t{0};
+  for (const auto& store : runtime.event_queue) {
+    count += store_live_count(store);
+  }
+  return count;
+}
+
+[[nodiscard]] auto queue_tail(mln::core::RuntimeObject& runtime)
+  -> mln_runtime_event* {
+  if (
+    runtime.event_queue.empty() ||
+    store_live_count(runtime.event_queue.back()) == 0
+  ) {
+    return nullptr;
+  }
+  return &runtime.event_queue.back().events.back();
+}
+
+auto append_event(
+  mln::core::RuntimeEventStore& store, mln_runtime_event event,
+  std::string_view message
+) -> void {
+  const auto message_bytes = message_arena_bytes(message);
+  store.events.reserve(store.events.size() + 1);
+  if (message_bytes != 0) {
+    store.messages.reserve(store.messages.size() + message_bytes);
+    event.message_offset = static_cast<uint32_t>(store.messages.size());
+    event.message_size = static_cast<uint32_t>(message.size());
+    store.messages.append(message.data(), message.size());
+    store.messages.push_back('\0');
+  } else {
+    event.message_offset = 0;
+    event.message_size = 0;
+  }
+  store.events.push_back(event);
+}
+
+// Caller holds event_mutex.
+auto enqueue_event(
+  mln::core::RuntimeObject& runtime, mln_runtime_event event,
+  std::string message
+) -> void {
+  message = truncated_event_message(std::move(message));
+  const auto message_bytes = message_arena_bytes(message);
+  if (
+    !runtime.event_queue.empty() &&
+    store_live_count(runtime.event_queue.back()) == 0
+  ) {
+    runtime.event_queue.back().events.clear();
+    runtime.event_queue.back().messages.clear();
+    runtime.event_queue.back().event_head = 0;
+    runtime.event_queue.back().message_head = 0;
+  }
+  if (
+    runtime.event_queue.empty() ||
+    !store_can_fit(runtime.event_queue.back(), message_bytes)
+  ) {
+    runtime.event_queue.emplace_back();
+  }
+  append_event(runtime.event_queue.back(), event, message);
+}
+
+[[nodiscard]] auto event_is_offline_region(const mln_runtime_event& event)
+  -> bool {
+  return event.type == MLN_RUNTIME_EVENT_OFFLINE_REGION_STATUS_CHANGED ||
+         event.type == MLN_RUNTIME_EVENT_OFFLINE_REGION_RESPONSE_ERROR ||
+         event.type ==
+           MLN_RUNTIME_EVENT_OFFLINE_REGION_TILE_COUNT_LIMIT_EXCEEDED;
+}
+
+[[nodiscard]] auto event_offline_region_id(const mln_runtime_event& event)
+  -> mln_offline_region_id {
+  switch (event.payload_type) {
+    case MLN_RUNTIME_EVENT_PAYLOAD_OFFLINE_REGION_STATUS:
+      return event.payload.offline_region_status.region_id;
+    case MLN_RUNTIME_EVENT_PAYLOAD_OFFLINE_REGION_RESPONSE_ERROR:
+      return event.payload.offline_region_response_error.region_id;
+    case MLN_RUNTIME_EVENT_PAYLOAD_OFFLINE_REGION_TILE_COUNT_LIMIT:
+      return event.payload.offline_region_tile_count_limit.region_id;
+    default:
+      return 0;
+  }
+}
+
+[[nodiscard]] auto event_is_offline_operation(const mln_runtime_event& event)
+  -> bool {
+  return event.type == MLN_RUNTIME_EVENT_OFFLINE_OPERATION_COMPLETED;
+}
+
+// Caller holds event_mutex. Rebuilds each touched arena so a later full drain
+// can still transfer a packed C-layout segment.
+template <typename Pred>
+auto erase_matching_events(mln::core::RuntimeObject& runtime, Pred&& pred)
+  -> void {
+  for (auto& store : runtime.event_queue) {
+    auto any = false;
+    for (auto index = store.event_head; index < store.events.size();
+         index += 1) {
+      if (pred(store.events[index])) {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      continue;
+    }
+
+    auto kept = std::vector<mln_runtime_event>{};
+    auto compacted = std::string{};
+    kept.reserve(store_live_count(store));
+    compacted.reserve(store.messages.size() - store.message_head);
+    for (auto index = store.event_head; index < store.events.size();
+         index += 1) {
+      const auto& event = store.events[index];
+      if (pred(event)) {
+        continue;
+      }
+      auto kept_event = event;
+      if (kept_event.message_size != 0) {
+        const auto offset = static_cast<uint32_t>(compacted.size());
+        compacted.append(
+          store.messages.data() + kept_event.message_offset,
+          kept_event.message_size
+        );
+        compacted.push_back('\0');
+        kept_event.message_offset = offset;
+      }
+      kept.push_back(kept_event);
+    }
+    store.events = std::move(kept);
+    store.messages = std::move(compacted);
+    store.event_head = 0;
+    store.message_head = 0;
+  }
+
+  std::erase_if(
+    runtime.event_queue, [](const mln::core::RuntimeEventStore& store) -> bool {
+      return store_live_count(store) == 0;
+    }
+  );
+
+  auto index = size_t{0};
+  while (index + 1 < runtime.event_queue.size()) {
+    auto& head = runtime.event_queue[index];
+    auto& next = runtime.event_queue[index + 1];
+    if (!store_can_fit(head, next.messages.size())) {
+      index += 1;
+      continue;
+    }
+    head.events.reserve(head.events.size() + next.events.size());
+    head.messages.reserve(head.messages.size() + next.messages.size());
+    const auto base = static_cast<uint32_t>(head.messages.size());
+    for (auto event : next.events) {
+      if (event.message_size != 0) {
+        event.message_offset += base;
+      }
+      head.events.push_back(event);
+    }
+    head.messages.append(next.messages);
+    runtime.event_queue.erase(
+      runtime.event_queue.begin() + static_cast<std::ptrdiff_t>(index + 1)
+    );
+  }
+}
+
+[[nodiscard]] auto count_drainable_events(
+  const std::vector<mln::core::RuntimeEventStore>& queue, size_t max_events
+) -> size_t {
+  auto take = size_t{0};
+  auto arena_size = size_t{0};
+  for (const auto& store : queue) {
+    for (auto index = store.event_head; index < store.events.size();
+         index += 1) {
+      const auto& event = store.events[index];
+      if (max_events != 0 && take >= max_events) {
+        return take;
+      }
+      const auto next_size = event.message_size == 0
+                               ? size_t{0}
+                               : static_cast<size_t>(event.message_size) + 1;
+      if (take != 0 && next_size > event_arena_max - arena_size) {
+        return take;
+      }
+      arena_size += next_size;
+      take += 1;
+    }
+  }
+  return take;
+}
+
+auto publish_event_batch(
+  const mln::core::RuntimeEventStore& batch, size_t remaining_count,
+  mln_runtime_event_batch* out_batch
+) -> void {
+  const auto live = store_live_count(batch);
+  *out_batch = mln_runtime_event_batch{
+    .size = sizeof(mln_runtime_event_batch),
+    .event_size = sizeof(mln_runtime_event),
+    .events = live == 0 ? nullptr : batch.events.data() + batch.event_head,
+    .event_count = live,
+    .messages = batch.messages.empty() ? nullptr : batch.messages.data(),
+    .messages_size = batch.messages.size(),
+    .remaining_count = remaining_count
+  };
+}
+
+// Copies the first `take` live events of `store` into `batch` and advances the
+// store heads. The taken messages are a slice of the packed arena.
+auto split_front_store(
+  mln::core::RuntimeEventStore& store, size_t take,
+  mln::core::RuntimeEventStore& batch
+) -> void {
+  const auto start = store.event_head;
+  auto split = store.message_head;
+  for (auto index = size_t{0}; index < take; index += 1) {
+    const auto end = event_message_end(store.events[start + index]);
+    if (end > split) {
+      split = end;
+    }
+  }
+  const auto message_bytes = split - store.message_head;
+  batch.events.reserve(take);
+  if (message_bytes != 0) {
+    batch.messages.reserve(message_bytes);
+  }
+  batch.events.assign(
+    store.events.begin() + start, store.events.begin() + start + take
+  );
+  if (message_bytes != 0) {
+    batch.messages.assign(
+      store.messages.data() + store.message_head, message_bytes
+    );
+  }
+  const auto adjust = static_cast<uint32_t>(store.message_head);
+  for (auto& event : batch.events) {
+    if (event.message_size != 0) {
+      event.message_offset -= adjust;
+    }
+  }
+  store.event_head += take;
+  store.message_head = split;
+}
+
+auto copy_and_pop_front(
+  std::vector<mln::core::RuntimeEventStore>& queue, size_t take,
+  mln::core::RuntimeEventStore& batch
+) -> void {
+  auto remaining = take;
+  for (const auto& store : queue) {
+    if (remaining == 0) {
+      break;
+    }
+    const auto from_store = std::min(remaining, store_live_count(store));
+    for (auto index = size_t{0}; index < from_store; index += 1) {
+      auto event = store.events[store.event_head + index];
+      if (event.message_size != 0) {
+        const auto offset = static_cast<uint32_t>(batch.messages.size());
+        batch.messages.append(
+          store.messages.data() + event.message_offset, event.message_size
+        );
+        batch.messages.push_back('\0');
+        event.message_offset = offset;
+      }
+      batch.events.push_back(event);
+    }
+    remaining -= from_store;
+  }
+
+  remaining = take;
+  while (remaining != 0 && !queue.empty()) {
+    auto& front = queue.front();
+    const auto live = store_live_count(front);
+    if (remaining >= live) {
+      remaining -= live;
+      queue.erase(queue.begin());
+      continue;
+    }
+    auto split = front.message_head;
+    for (auto index = size_t{0}; index < remaining; index += 1) {
+      const auto end =
+        event_message_end(front.events[front.event_head + index]);
+      if (end > split) {
+        split = end;
+      }
+    }
+    front.event_head += remaining;
+    front.message_head = split;
+    remaining = 0;
+  }
+}
+
+// Caller holds event_mutex. A full drain of one live segment swaps the C-layout
+// buffers into the owned batch. Bounded and multi-segment drains copy.
+auto take_queued_events(
+  std::vector<mln::core::RuntimeEventStore>& queue, size_t take,
+  mln::core::RuntimeEventStore& batch
+) -> void {
+  if (take == 0 || queue.empty()) {
+    return;
+  }
+  const auto front_live = store_live_count(queue.front());
+  if (queue.size() == 1 && take == front_live) {
+    static_assert(
+      std::is_nothrow_swappable_v<mln::core::RuntimeEventStore>,
+      "a throwing swap would leave the queue and batch half-exchanged"
+    );
+    std::swap(batch, queue.front());
+    queue.front().events.clear();
+    queue.front().messages.clear();
+    queue.front().event_head = 0;
+    queue.front().message_head = 0;
+    return;
+  }
+  if (take == front_live) {
+    static_assert(
+      std::is_nothrow_move_assignable_v<mln::core::RuntimeEventStore>
+    );
+    batch = std::move(queue.front());
+    queue.erase(queue.begin());
+    return;
+  }
+  if (take < front_live) {
+    split_front_store(queue.front(), take, batch);
+    return;
+  }
+  batch.events.reserve(take);
+  copy_and_pop_front(queue, take, batch);
 }
 
 auto valid_coordinate(const mln_lat_lng& coordinate) -> bool {
@@ -669,16 +1024,15 @@ auto push_offline_region_event(
     return;
   }
 
-  auto event = mln::core::QueuedRuntimeEvent{
+  auto event = mln_runtime_event{
     .type = type,
     .source_type = MLN_RUNTIME_EVENT_SOURCE_RUNTIME,
     .source = runtime->self,
     .code = 0,
     .payload_type = payload_type,
-    .payload = payload,
-    .message = truncated_event_message(std::move(message)),
-    .has_offline_region = true,
-    .offline_region_id = region_id
+    .message_offset = 0,
+    .message_size = 0,
+    .payload = payload
   };
 
   {
@@ -686,7 +1040,7 @@ auto push_offline_region_event(
     if (!runtime->observed_offline_regions.contains(region_id)) {
       return;
     }
-    runtime->events.push_back(std::move(event));
+    enqueue_event(*runtime, event, std::move(message));
   }
   // The offline region observer runs off the owner-thread run loop, so this
   // signal releases a parked owner thread.
@@ -769,9 +1123,12 @@ auto set_offline_region_observed_flag(
     runtime->observed_offline_regions.insert(region_id);
   } else {
     runtime->observed_offline_regions.erase(region_id);
-    std::erase_if(runtime->events, [region_id](const auto& event) -> bool {
-      return event.has_offline_region && event.offline_region_id == region_id;
-    });
+    erase_matching_events(
+      *runtime, [region_id](const mln_runtime_event& event) -> bool {
+        return event_is_offline_region(event) &&
+               event_offline_region_id(event) == region_id;
+      }
+    );
   }
 }
 
@@ -882,10 +1239,13 @@ auto erase_queued_offline_operation_events(
   mln::core::RuntimeObject* runtime, mln_offline_operation_id operation_id
 ) -> void {
   const std::scoped_lock event_lock(runtime->event_mutex);
-  std::erase_if(runtime->events, [operation_id](const auto& event) -> bool {
-    return event.has_offline_operation &&
-           event.offline_operation_id == operation_id;
-  });
+  erase_matching_events(
+    *runtime, [operation_id](const mln_runtime_event& event) -> bool {
+      return event_is_offline_operation(event) &&
+             event.payload.offline_operation_completed.operation_id ==
+               operation_id;
+    }
+  );
 }
 
 auto erase_offline_operation_registration(
@@ -977,23 +1337,20 @@ auto complete_offline_operation(
     return;
   }
 
-  auto event = mln::core::QueuedRuntimeEvent{
+  auto event = mln_runtime_event{
     .type = MLN_RUNTIME_EVENT_OFFLINE_OPERATION_COMPLETED,
     .source_type = MLN_RUNTIME_EVENT_SOURCE_RUNTIME,
     .source = runtime->self,
     .code = result_status,
     .payload_type = MLN_RUNTIME_EVENT_PAYLOAD_OFFLINE_OPERATION_COMPLETED,
-    .payload = make_offline_completion_payload(operation),
-    .message = truncated_event_message(operation.message),
-    .has_offline_region = false,
-    .offline_region_id = 0,
-    .has_offline_operation = true,
-    .offline_operation_id = operation_id
+    .message_offset = 0,
+    .message_size = 0,
+    .payload = make_offline_completion_payload(operation)
   };
 
   {
     const std::scoped_lock event_lock(runtime->event_mutex);
-    runtime->events.push_back(std::move(event));
+    enqueue_event(*runtime, event, operation.message);
   }
   mln::core::signal_wake(runtime->wake_state);
 }
@@ -2905,9 +3262,11 @@ auto destroy_runtime(mln_runtime runtime) -> mln_status {
     owned_runtime->offline_event_state->runtime = nullptr;
     const std::scoped_lock event_lock(owned_runtime->event_mutex);
     owned_runtime->observed_offline_regions.clear();
-    std::erase_if(owned_runtime->events, [](const auto& event) -> bool {
-      return event.has_offline_region;
-    });
+    erase_matching_events(
+      *owned_runtime, [](const mln_runtime_event& event) -> bool {
+        return event_is_offline_region(event);
+      }
+    );
   }
 
   {
@@ -2918,16 +3277,18 @@ auto destroy_runtime(mln_runtime runtime) -> mln_status {
     owned_runtime->offline_operation_state->runtime = nullptr;
     owned_runtime->offline_operation_state->operations.clear();
     const std::scoped_lock event_lock(owned_runtime->event_mutex);
-    std::erase_if(owned_runtime->events, [](const auto& event) -> bool {
-      return event.has_offline_operation;
-    });
+    erase_matching_events(
+      *owned_runtime, [](const mln_runtime_event& event) -> bool {
+        return event_is_offline_operation(event);
+      }
+    );
   }
 
   // The last drained batch is freed with the runtime, the documented end of its
   // readable window.
-  owned_runtime->event_drain_staging.clear();
-  owned_runtime->event_batch_events.clear();
-  owned_runtime->event_batch_messages.clear();
+  owned_runtime->event_queue.clear();
+  owned_runtime->event_batch.events.clear();
+  owned_runtime->event_batch.messages.clear();
 
   // Retiring the wake state before the run loop is released covers a late
   // `mln_wake_source_signal()` and the run loop teardown's final iteration.
@@ -2971,7 +3332,7 @@ auto pump_runtime(mln_runtime runtime, int64_t timeout_ms) -> mln_status {
   auto queued_events = false;
   {
     const std::scoped_lock event_lock(live->event_mutex);
-    queued_events = !live->events.empty();
+    queued_events = queued_event_count(*live) != 0;
   }
 
   {
@@ -3050,86 +3411,22 @@ auto drain_runtime_events(
   // Clearing first ends the previous batch's window, so an empty drain
   // invalidates it too. Capacity survives, so a steady-state drain allocates
   // nothing.
-  auto& staging = live->event_drain_staging;
-  auto& events = live->event_batch_events;
-  auto& messages = live->event_batch_messages;
-  staging.clear();
-  events.clear();
-  messages.clear();
+  auto& batch = live->event_batch;
+  batch.events.clear();
+  batch.messages.clear();
 
   auto remaining_count = size_t{0};
-  auto arena_size = size_t{0};
-  auto drain_count = size_t{0};
   {
     const std::scoped_lock lock(live->event_mutex);
-    for (const auto& queued : live->events) {
-      if (max_events != 0 && drain_count >= max_events) {
-        break;
-      }
-      // The first event always fits, so a bounded drain always makes progress.
-      // An event without a message takes no arena bytes, not even a terminator.
-      const auto& next_message = queued.message;
-      const auto next_size =
-        next_message.empty() ? size_t{0} : next_message.size() + 1;
-      if (
-        drain_count != 0 &&
-        next_size > static_cast<size_t>(UINT32_MAX) - arena_size
-      ) {
-        break;
-      }
-      arena_size += next_size;
-      drain_count += 1;
-    }
-
-    // Finish every allocation before removing an event. The reserved staging
-    // moves and batch writes below cannot allocate, so a failed reservation
-    // leaves the complete queue available to the next drain.
-    static_assert(
-      std::is_nothrow_move_constructible_v<mln::core::QueuedRuntimeEvent>
-    );
-    staging.reserve(drain_count);
-    events.reserve(drain_count);
-    messages.reserve(arena_size);
-    for (auto index = size_t{0}; index < drain_count; index += 1) {
-      staging.push_back(std::move(live->events.front()));
-      live->events.pop_front();
-    }
-    remaining_count = live->events.size();
+    const auto drain_count =
+      count_drainable_events(live->event_queue, max_events);
+    remaining_count = queued_event_count(*live) - drain_count;
+    // A full drain of one live segment swaps the C-layout buffers into the
+    // owned batch. Bounded and multi-segment drains copy a prefix.
+    take_queued_events(live->event_queue, drain_count, batch);
   }
 
-  // The batch is built outside the lock, so the lock hold covers only the
-  // queue moves above.
-  for (const auto& staged : staging) {
-    const auto message_size = static_cast<uint32_t>(staged.message.size());
-    const auto message_offset = static_cast<uint32_t>(messages.size());
-    events.push_back(
-      mln_runtime_event{
-        .type = staged.type,
-        .source_type = staged.source_type,
-        .source = staged.source,
-        .code = staged.code,
-        .payload_type = staged.payload_type,
-        .message_offset = message_size == 0 ? 0 : message_offset,
-        .message_size = message_size,
-        .payload = staged.payload
-      }
-    );
-    if (message_size != 0) {
-      messages.append(staged.message);
-      messages.push_back('\0');
-    }
-  }
-  staging.clear();
-
-  *out_batch = mln_runtime_event_batch{
-    .size = sizeof(mln_runtime_event_batch),
-    .event_size = sizeof(mln_runtime_event),
-    .events = events.empty() ? nullptr : events.data(),
-    .event_count = events.size(),
-    .messages = messages.empty() ? nullptr : messages.data(),
-    .messages_size = messages.size(),
-    .remaining_count = remaining_count
-  };
+  publish_event_batch(batch, remaining_count, out_batch);
   return MLN_STATUS_OK;
 }
 
@@ -3325,14 +3622,15 @@ auto push_runtime_map_event_payload(
     return;
   }
 
-  auto event = QueuedRuntimeEvent{
+  auto event = mln_runtime_event{
     .type = type,
     .source_type = MLN_RUNTIME_EVENT_SOURCE_MAP,
     .source = map,
     .code = code,
     .payload_type = payload_type,
-    .payload = payload,
-    .message = truncated_event_message(std::move(message))
+    .message_offset = 0,
+    .message_size = 0,
+    .payload = payload
   };
 
   {
@@ -3345,12 +3643,14 @@ auto push_runtime_map_event_payload(
     // alone preserves the order of every other event.
     if (
       type == MLN_RUNTIME_EVENT_MAP_RENDER_UPDATE_AVAILABLE &&
-      map != MLN_HANDLE_NULL && !live->events.empty() &&
-      live->events.back().type == type && live->events.back().source == map
+      map != MLN_HANDLE_NULL
     ) {
-      return;
+      const auto* tail = queue_tail(*live);
+      if (tail != nullptr && tail->type == type && tail->source == map) {
+        return;
+      }
     }
-    live->events.push_back(std::move(event));
+    enqueue_event(*live, event, std::move(message));
   }
   signal_wake(live->wake_state);
 }
@@ -3373,7 +3673,7 @@ auto discard_runtime_map_events(mln_runtime runtime, mln_map map) -> void {
 
   const std::scoped_lock lock(live->event_mutex);
   live->event_maps.erase(map);
-  std::erase_if(live->events, [map](const auto& event) -> bool {
+  erase_matching_events(*live, [map](const mln_runtime_event& event) -> bool {
     return event.source == map;
   });
 }

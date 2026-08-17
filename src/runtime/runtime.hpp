@@ -5,13 +5,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -158,21 +158,20 @@ struct WakeState {
 
 struct OfflineOperationEventState;
 
-struct QueuedRuntimeEvent {
-  uint32_t type;
-  uint32_t source_type;
-  // The mln_map for map-originated events, the mln_runtime otherwise, as
-  // selected by source_type.
-  uint64_t source;
-  int32_t code;
-  uint32_t payload_type;
-  mln_runtime_event_payload payload = zeroed_event_payload();
-  std::string message;
-  bool has_offline_region = false;
-  mln_offline_region_id offline_region_id = 0;
-  bool has_offline_operation = false;
-  mln_offline_operation_id offline_operation_id = 0;
+// One C-layout segment: the event records and message arena a batch publishes.
+// A full drain of a single live segment swaps these buffers into event_batch.
+// Bounded drains advance the heads instead of erasing from the front.
+struct RuntimeEventStore {
+  std::vector<mln_runtime_event> events;
+  std::string messages;
+  size_t event_head = 0;
+  size_t message_head = 0;
 };
+
+static_assert(
+  std::is_trivially_copyable_v<mln_runtime_event>,
+  "queued events stay in public C layout so a full drain can move the records"
+);
 
 struct RuntimeObject {
   mln_runtime self = MLN_HANDLE_NULL;
@@ -195,14 +194,14 @@ struct RuntimeObject {
   std::size_t live_maps = 0;
   mutable std::mutex event_mutex;
   std::unordered_set<mln_map> event_maps;
-  std::deque<mln::core::QueuedRuntimeEvent> events;
+  // Segments of queued events already in public C layout. A message that would
+  // push one arena past 4 GiB starts another segment.
+  std::vector<RuntimeEventStore> event_queue;
   std::unordered_set<mln_offline_region_id> observed_offline_regions;
-  // Owner-thread only. A drain is the only reader and writer, and every drain
-  // is owner-thread affine, so event_mutex does not guard these three. Each
-  // keeps its capacity, so a steady-state drain allocates nothing.
-  std::vector<mln::core::QueuedRuntimeEvent> event_drain_staging;
-  std::vector<mln_runtime_event> event_batch_events;
-  std::string event_batch_messages;
+  // Owner-thread only. Drain is the only reader and writer. Producers never
+  // touch it; event_mutex covers the swap that detaches it from the queue.
+  // Capacity survives a clear, so a steady-state drain allocates nothing.
+  RuntimeEventStore event_batch;
 };
 
 template <>
